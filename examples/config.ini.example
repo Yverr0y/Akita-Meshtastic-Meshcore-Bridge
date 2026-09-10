@@ -41,7 +41,9 @@ SERIAL_BAUD_RATE = 9600
 #   raw_serial:   Reads raw binary/text bytes and forwards them as Hex.
 #                 (Use this for MeshCore Companion Mode or binary protocols)
 #   companion_radio: MeshCore Companion USB framing protocol (recommended for MeshCore radios)
-SERIAL_PROTOCOL = json_newline  # Use json_newline for text/JSON, raw_serial for binary/hex, companion_radio for MeshCore USB framing
+# Use json_newline for text/JSON, raw_serial for binary/hex, or
+# companion_radio for MeshCore USB framing.
+SERIAL_PROTOCOL = json_newline
 
 # Auto-switch between json_newline and raw_serial after repeated decode failures.
 # Set False to disable protocol auto-detection.
@@ -103,6 +105,24 @@ MESSAGE_QUEUE_SIZE = 100
 API_ENABLED = False
 API_HOST = 127.0.0.1
 API_PORT = 8080
+# Optional bearer/X-API-Token secret. Required if API_HOST is 0.0.0.0.
+API_TOKEN =
+
+# --- Rate Limiting ---
+# Max forwarded messages allowed per RATE_LIMIT_WINDOW_S seconds
+RATE_LIMIT_MAX_MESSAGES = 60
+RATE_LIMIT_WINDOW_S = 60
+
+# --- Message Persistence ---
+# Optional JSONL message log. Leave blank to disable.
+MESSAGE_LOG_FILE =
+MESSAGE_LOG_MAX_MB = 10
+MESSAGE_LOG_MAX_BACKUPS = 5
+
+# --- Meshtastic Reconnect ---
+# Keep retrying if the Meshtastic radio is missing at boot
+MESHTASTIC_RETRY_ON_BOOT = True
+MESHTASTIC_RETRY_DELAY_S = 10
 
 # --- MQTT TLS/SSL Settings ---
 # Enable TLS/SSL for MQTT connections (only used if EXTERNAL_TRANSPORT = mqtt)

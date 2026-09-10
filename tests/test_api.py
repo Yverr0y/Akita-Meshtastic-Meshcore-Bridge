@@ -1,0 +1,232 @@
+import json
+import threading
+from queue import Queue
+from types import SimpleNamespace
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+from unittest.mock import patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from ammb.api import BridgeAPIServer, extract_request_token, token_matches
+from ammb.api_async import app, configure_async_api, reset_async_api
+from ammb.metrics import get_metrics
+from ammb.version import __version__
+from tests.conftest import make_bridge_config
+
+
+class _FakeBridge:
+    def __init__(self, config):
+        self.config = config
+        self.meshtastic_handler = SimpleNamespace(
+            _is_connected=threading.Event()
+        )
+        self.external_handler = SimpleNamespace(
+            _is_connected=threading.Event()
+        )
+        self.to_meshtastic_queue = Queue()
+        self.to_external_queue = Queue()
+
+
+def _request(host, port, method, path, body=None, headers=None):
+    payload = None
+    req_headers = {"Accept": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    if body is not None:
+        payload = json.dumps(body).encode("utf-8")
+        req_headers["Content-Type"] = "application/json"
+    request = Request(
+        f"http://{host}:{port}{path}",
+        data=payload,
+        headers=req_headers,
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            return response.status, data
+    except HTTPError as exc:
+        data = json.loads(exc.read().decode("utf-8"))
+        return exc.code, data
+
+
+def test_extract_request_token_supports_bearer_and_header():
+    assert extract_request_token("Bearer secret", None) == "secret"
+    assert extract_request_token(None, "header-secret") == "header-secret"
+    assert extract_request_token(None, None) is None
+
+
+def test_token_matches_allows_open_api_when_unset():
+    assert token_matches(None, None) is True
+    assert token_matches("abc", "abc") is True
+    assert token_matches("abc", "nope") is False
+
+
+def test_sync_api_info_uses_package_version():
+    config = make_bridge_config(api_enabled=True, api_port=0)
+    bridge = _FakeBridge(config)
+    server = BridgeAPIServer(bridge, host="127.0.0.1", port=0)
+    server.start()
+    try:
+        status, data = _request("127.0.0.1", server.port, "GET", "/api/info")
+        assert status == 200
+        assert data["version"] == __version__
+        assert data["external_transport"] == "serial"
+    finally:
+        server.stop()
+
+
+def test_sync_api_startup_failure_is_fatal():
+    bridge = _FakeBridge(make_bridge_config(api_enabled=True))
+    server = BridgeAPIServer(bridge, host="127.0.0.1", port=8080)
+
+    with patch(
+        "ammb.api.ThreadingHTTPServer",
+        side_effect=OSError("address unavailable"),
+    ), pytest.raises(RuntimeError, match="configured API server"):
+        server.start()
+
+
+def test_sync_api_requires_token_when_configured():
+    config = make_bridge_config(
+        api_enabled=True,
+        api_port=0,
+        api_token="s3cret",
+    )
+    bridge = _FakeBridge(config)
+    server = BridgeAPIServer(bridge, host="127.0.0.1", port=0)
+    server.start()
+    try:
+        status, data = _request(
+            "127.0.0.1", server.port, "GET", "/api/health"
+        )
+        assert status == 401
+        assert data["error"] == "Unauthorized"
+
+        status, data = _request(
+            "127.0.0.1",
+            server.port,
+            "GET",
+            "/api/health",
+            headers={"Authorization": "Bearer s3cret"},
+        )
+        assert status == 200
+        assert "status" in data
+    finally:
+        server.stop()
+
+
+def test_sync_api_reset_metrics():
+    get_metrics().record_meshtastic_received(4)
+    config = make_bridge_config(api_enabled=True, api_port=0)
+    bridge = _FakeBridge(config)
+    server = BridgeAPIServer(bridge, host="127.0.0.1", port=0)
+    server.start()
+    try:
+        status, data = _request(
+            "127.0.0.1",
+            server.port,
+            "POST",
+            "/api/control",
+            body={"action": "reset_metrics"},
+        )
+        assert status == 200
+        assert data["message"] == "Metrics reset"
+        stats = get_metrics().get_all_stats()
+        assert stats["meshtastic"]["messages"]["total_received"] == 0
+    finally:
+        server.stop()
+
+
+def test_sync_api_rejects_oversized_control_body():
+    config = make_bridge_config(api_enabled=True, api_port=0)
+    server = BridgeAPIServer(_FakeBridge(config), host="127.0.0.1", port=0)
+    server.start()
+    try:
+        status, data = _request(
+            "127.0.0.1",
+            server.port,
+            "POST",
+            "/api/control",
+            body={"payload": "x" * (64 * 1024)},
+        )
+        assert status == 413
+        assert data["error"] == "Request body too large"
+    finally:
+        server.stop()
+
+
+def test_metrics_get_all_stats_does_not_deadlock():
+    get_metrics().record_meshtastic_connection()
+    stats = get_metrics().get_all_stats()
+    assert "meshtastic" in stats
+    assert "current_uptime_seconds" in stats["meshtastic"]["connection"]
+
+
+def test_async_api_requires_token_and_reports_version():
+    reset_async_api()
+    configure_async_api(_FakeBridge(make_bridge_config()), token="tok")
+    client = TestClient(app)
+    denied = client.get("/api/info")
+    assert denied.status_code == 401
+
+    allowed = client.get(
+        "/api/info", headers={"X-API-Token": "tok"}
+    )
+    assert allowed.status_code == 200
+    assert allowed.json()["version"] == __version__
+    reset_async_api()
+
+
+def test_async_api_rejects_invalid_and_oversized_control_bodies():
+    reset_async_api()
+    client = TestClient(app)
+
+    invalid = client.post(
+        "/api/control",
+        content=b"not-json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert invalid.status_code == 400
+
+    oversized = client.post(
+        "/api/control",
+        content=b"x" * (64 * 1024 + 1),
+        headers={"Content-Type": "application/json"},
+    )
+    assert oversized.status_code == 413
+
+
+def test_non_ascii_token_does_not_crash_authentication():
+    assert token_matches("secret", "sécret") is False
+    assert token_matches("sécret", "sécret") is True
+
+
+@pytest.mark.parametrize("async_api", [False, True])
+def test_api_reports_live_mqtt_connection(async_api):
+    from ammb.mqtt_handler import MQTTHandler
+    from tests.test_mqtt import _mqtt_config
+
+    bridge = _FakeBridge(_mqtt_config())
+    bridge.external_handler = MQTTHandler(
+        bridge.config, Queue(), Queue(), threading.Event()
+    )
+    bridge.external_handler._mqtt_connected.set()
+    if async_api:
+        configure_async_api(bridge)
+        try:
+            response = TestClient(app).get("/api/info")
+            assert response.json()["external_connected"] is True
+        finally:
+            reset_async_api()
+    else:
+        server = BridgeAPIServer(bridge, host="127.0.0.1", port=0)
+        server.start()
+        try:
+            status, data = _request("127.0.0.1", server.port, "GET", "/api/info")
+            assert status == 200
+            assert data["external_connected"] is True
+        finally:
+            server.stop()

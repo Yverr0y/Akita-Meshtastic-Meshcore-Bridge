@@ -12,8 +12,10 @@ This script handles:
 - Handling graceful shutdown on KeyboardInterrupt (Ctrl+C).
 """
 
+import argparse
 import logging
 import os
+import signal
 import sys
 
 # Ensure the script can find the 'ammb' package
@@ -45,7 +47,8 @@ except ImportError as e:
 # --- Imports ---
 try:
     from ammb import Bridge
-    from ammb.config_handler import CONFIG_FILE, load_config
+    from ammb.config_handler import resolve_config_path
+    from ammb.preflight import run_preflight
     from ammb.utils import setup_logging
 except ImportError as e:
     print(f"ERROR: Failed to import AMMB modules: {e}", file=sys.stderr)
@@ -57,7 +60,20 @@ except ImportError as e:
 
 
 # --- Main Execution ---
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Run the AMMB production bridge."
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to config.ini. Defaults to AMMB_CONFIG, ./config.ini, "
+            "then the project-root config.ini."
+        ),
+    )
+    args = parser.parse_args(argv)
+
     # Basic logging setup until config is loaded
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -65,14 +81,31 @@ def main():
     logging.info("--- Akita Meshtastic Meshcore Bridge Starting ---")
 
     # --- Configuration Loading ---
-    config_path = os.path.join(project_root, CONFIG_FILE)
-    logging.info(f"Loading configuration from: {config_path}")
-    config = load_config(config_path)
-    if not config:
+    config_path = resolve_config_path(
+        args.config, fallback=os.path.join(project_root, "config.ini")
+    )
+    logging.info("Loading configuration from: %s", config_path)
+    report = run_preflight(config_path)
+    config = report.config
+    if not report.ready or config is None:
+        for diagnostic in report.diagnostics:
+            log = (
+                logging.error
+                if diagnostic.is_error
+                else logging.warning
+            )
+            log("Preflight %s: %s", diagnostic.title, diagnostic.detail)
         logging.critical("Failed to load configuration. Bridge cannot start.")
         sys.exit(1)
+    for diagnostic in report.diagnostics:
+        if diagnostic.severity.lower() == "warning":
+            logging.warning(
+                "Preflight warning: %s: %s",
+                diagnostic.title,
+                diagnostic.detail,
+            )
     logging.info("Configuration loaded successfully.")
-    logging.info(f"Selected external transport: {config.external_transport}")
+    logging.info("Selected external transport: %s", config.external_transport)
 
     # --- Logging Setup ---
     setup_logging(config.log_level)
@@ -89,6 +122,14 @@ def main():
         )
         sys.exit(1)
 
+    def _handle_sigterm(signum, _frame):
+        logging.info(
+            "Signal %s received. Initiating graceful shutdown...", signum
+        )
+        bridge.shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     try:
         logging.info("Starting bridge run loop...")
         bridge.run()
@@ -98,7 +139,8 @@ def main():
         )
     except Exception as e:
         logging.critical(
-            f"Unhandled critical exception in bridge execution: {e}",
+            "Unhandled critical exception in bridge execution: %s",
+            e,
             exc_info=True,
         )
         logging.info("Attempting emergency shutdown...")
@@ -107,6 +149,7 @@ def main():
 
     logging.info("--- Akita Meshtastic Meshcore Bridge Stopped ---")
     sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

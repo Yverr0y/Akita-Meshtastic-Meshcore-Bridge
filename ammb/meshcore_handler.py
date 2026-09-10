@@ -16,9 +16,9 @@ from .config_handler import BridgeConfig
 from .health import HealthStatus, get_health_monitor
 from .metrics import get_metrics
 from .protocol import MeshcoreProtocolHandler, get_serial_protocol_handler
-from .rate_limiter import RateLimiter
+from .message_logger import get_message_logger
+from .rate_limiter import limiter_from_config
 from .validator import MessageValidator
-
 
 
 class MeshcoreHandler:
@@ -26,6 +26,9 @@ class MeshcoreHandler:
 
     RECONNECT_DELAY_S = 10
     AUTO_DETECT_FAILURE_THRESHOLD = 5
+    receiver_thread: Optional[threading.Thread]
+    sender_thread: Optional[threading.Thread]
+    _contacts_poll_thread: Optional[threading.Thread]
 
     def start_threads(self):
         """Start the receiver and sender threads for MeshcoreHandler."""
@@ -80,9 +83,9 @@ class MeshcoreHandler:
         self.shutdown_event = shutdown_event
 
         self.serial_port: Optional[serial.Serial] = None
-        self.receiver_thread: Optional[threading.Thread] = None
-        self.sender_thread: Optional[threading.Thread] = None
-        self._contacts_poll_thread: Optional[threading.Thread] = None
+        self.receiver_thread = None
+        self.sender_thread = None
+        self._contacts_poll_thread = None
         self._lock = threading.Lock()
         self._is_connected = threading.Event()
 
@@ -90,7 +93,7 @@ class MeshcoreHandler:
         self.metrics = get_metrics()
         self.health_monitor = get_health_monitor()
         self.validator = MessageValidator()
-        self.rate_limiter = RateLimiter(max_messages=60, time_window=60.0)
+        self.rate_limiter = limiter_from_config(config)
 
         if (
             not config.serial_port
@@ -600,6 +603,10 @@ class MeshcoreHandler:
                                 self.to_meshtastic_queue.put_nowait(
                                     meshtastic_msg
                                 )
+                                get_message_logger().log_message(
+                                    meshtastic_msg,
+                                    "external_to_meshtastic",
+                                )
                                 payload_size = (
                                     len(text_payload_str.encode("utf-8"))
                                     if text_payload_str
@@ -702,6 +709,9 @@ class MeshcoreHandler:
                                 self.metrics.record_external_sent(
                                     len(encoded_message)
                                 )
+                                get_message_logger().log_message(
+                                    item, "meshtastic_to_external"
+                                )
                             except serial.SerialException as e:
                                 self.logger.error(
                                     "Serial error during send (%s): %s.",
@@ -773,7 +783,7 @@ class MeshcoreHandler:
 
         # CMD_SEND_CHANNEL_TXT_MSG (3)
         txt_type = 0
-        channel_idx = int(item.get("channel_index", 0))
+        channel_idx = int(item.get("channel_index", 0) or 0)
         sender_meshtastic_id = item.get("sender_meshtastic_id")
         sender_display_name = item.get("sender_display_name")
         sender_label = (

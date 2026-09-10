@@ -68,6 +68,32 @@ LOG_LEVEL = INFO
     assert report.diagnostics[0].title == "MQTT CA certificate missing"
 
 
+def test_preflight_warns_when_mqtt_certificate_checks_are_disabled(tmp_path):
+    config_path = _write_config(
+        tmp_path / "mqtt.ini",
+        """
+EXTERNAL_TRANSPORT = mqtt
+MQTT_BROKER = broker.example
+MQTT_PORT = 8883
+MQTT_TOPIC_IN = ammb/in
+MQTT_TOPIC_OUT = ammb/out
+MQTT_CLIENT_ID = bridge-client
+MQTT_QOS = 1
+MQTT_RETAIN_OUT = False
+MQTT_TLS_ENABLED = True
+MQTT_TLS_INSECURE = True
+LOG_LEVEL = INFO
+""",
+    )
+
+    report = run_preflight(str(config_path), importer=_fake_importer)
+
+    assert report.ready is True
+    assert "MQTT certificate verification disabled" in {
+        item.title for item in report.diagnostics
+    }
+
+
 def test_preflight_allows_warnings_without_blocking_start(tmp_path):
     config_path = _write_config(
         tmp_path / "serial.ini",
@@ -91,6 +117,50 @@ LOG_LEVEL = DEBUG
     assert "Verbose logging enabled" in titles
     assert "Meshtastic serial port" in titles
     assert "External serial port" in titles
+
+
+def test_preflight_errors_when_public_api_has_no_token(tmp_path):
+    config_path = _write_config(
+        tmp_path / "api.ini",
+        """
+MESHTASTIC_SERIAL_PORT = /dev/ttyUSB0
+EXTERNAL_TRANSPORT = serial
+SERIAL_PORT = /dev/ttyS0
+SERIAL_BAUD_RATE = 115200
+SERIAL_PROTOCOL = companion_radio
+API_ENABLED = True
+API_HOST = 0.0.0.0
+API_PORT = 8080
+""",
+    )
+
+    report = run_preflight(str(config_path), importer=_fake_importer)
+    titles = {item.title for item in report.diagnostics}
+
+    assert report.ready is False
+    assert "API token is not set" in titles
+
+
+def test_preflight_hides_api_token(tmp_path):
+    config_path = _write_config(
+        tmp_path / "api.ini",
+        """
+MESHTASTIC_SERIAL_PORT = /dev/ttyUSB0
+EXTERNAL_TRANSPORT = serial
+SERIAL_PORT = /dev/ttyS0
+SERIAL_BAUD_RATE = 115200
+SERIAL_PROTOCOL = json_newline
+API_ENABLED = True
+API_TOKEN = super-secret-token
+""",
+    )
+
+    report = run_preflight(str(config_path), importer=_fake_importer)
+    summary = dict(build_config_summary(report.config))
+    rendered = format_preflight_report(report)
+
+    assert summary["API token"] == "configured (hidden)"
+    assert "super-secret-token" not in rendered
 
 
 def test_preflight_reports_missing_config(tmp_path):
